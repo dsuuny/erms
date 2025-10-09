@@ -1,0 +1,163 @@
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    and_,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, object_session
+from sqlalchemy.ext.associationproxy import association_proxy
+from sqlalchemy.ext.declarative import declared_attr
+
+# 1. 基础设置
+Base = declarative_base()
+engine = create_engine("sqlite:///:memory:", echo=True) # echo=True 打印 SQL
+Session = sessionmaker(bind=engine)
+session = Session()
+
+# 2. 实体类型映射
+ENTITY_TYPE_MAP = {}
+
+# 3. 核心模型：EntityHierarchy
+class EntityHierarchy(Base):
+    __tablename__ = 'entity_hierarchy'
+    id = Column(Integer, primary_key=True)
+    parent_uuid = Column(UUID(as_uuid=True), nullable=False)
+    parent_entity_type = Column(String(50), nullable=False)
+    child_uuid = Column(UUID(as_uuid=True), nullable=False)
+    child_entity_type = Column(String(50), nullable=False)
+
+    def __repr__(self):
+        return (
+            f"<EntityHierarchy parent='{self.parent_entity_type}:{self.parent_uuid}' "
+            f"-> child='{self.child_entity_type}:{self.child_uuid}'>"
+        )
+
+    @property
+    def parent(self):
+        session = object_session(self)
+        if not session: return None
+        parent_class = ENTITY_TYPE_MAP.get(self.parent_entity_type)
+        if not parent_class: return None
+        return session.query(parent_class).filter_by(uuid=self.parent_uuid).one_or_none()
+
+    @property
+    def child(self):
+        session = object_session(self)
+        if not session: return None
+        child_class = ENTITY_TYPE_MAP.get(self.child_entity_type)
+        if not child_class: return None
+        return session.query(child_class).filter_by(uuid=self.child_uuid).one_or_none()
+    
+    # 构造函数，供 association_proxy 使用
+    def __init__(self, child):
+        # 当 association_proxy 创建实例时，它会传入 child 对象
+        # 我们需要从中提取 uuid 和 type
+        self.child_uuid = child.uuid
+        self.child_entity_type = child.__entity_type__
+
+
+# 4. 共享基类/Mixin
+class BaseEntityMixin:
+    id = Column(Integer, primary_key=True)
+    uuid = Column(UUID(as_uuid=True), unique=True, nullable=False, default=uuid.uuid4)
+    name = Column(String(100))
+    start_time = Column(DateTime, default=datetime.utcnow)
+    end_time = Column(DateTime)
+    __entity_type__ = None 
+
+    def __repr__(self):
+        return f"<{self.__class__.__name__}(name='{self.name}')>"
+
+    @declared_attr
+    def children_assocs(cls):
+        return relationship(
+            "EntityHierarchy",
+            primaryjoin=lambda: and_(
+                cls.uuid == EntityHierarchy.parent_uuid,
+                EntityHierarchy.parent_entity_type == cls.__entity_type__
+            ),
+            cascade="all, delete-orphan",
+            backref="parent_ref" # 添加 backref 以便从 EntityHierarchy 访问
+        )
+
+    @declared_attr
+    def parent_assocs(cls):
+        return relationship(
+            "EntityHierarchy",
+            primaryjoin=lambda: and_(
+                cls.uuid == EntityHierarchy.child_uuid,
+                EntityHierarchy.child_entity_type == cls.__entity_type__
+            ),
+            cascade="all, delete-orphan",
+            backref="child_ref" # 添加 backref
+        )
+
+    children = association_proxy("children_assocs", "child")
+    parents = association_proxy("parent_assocs", "parent")
+
+# 5. 具体实体模型
+class Dic(BaseEntityMixin, Base):
+    __tablename__ = 'dic'
+    __entity_type__ = 'dic'
+
+class Table(BaseEntityMixin, Base):
+    __tablename__ = 'table'
+    __entity_type__ = 'table'
+
+class Field(BaseEntityMixin, Base):
+    __tablename__ = 'field'
+    __entity_type__ = 'field'
+
+# 6. 填充映射
+ENTITY_TYPE_MAP['dic'] = Dic
+ENTITY_TYPE_MAP['table'] = Table
+ENTITY_TYPE_MAP['field'] = Field
+
+# 7. 创建数据库表
+Base.metadata.create_all(engine)
+
+# --- 使用示例 ---
+
+# 创建实例
+dic1 = Dic(name="Customer Dictionary")
+table1 = Table(name="Users Table")
+field1 = Field(name="Username Field")
+field2 = Field(name="Email Field")
+
+# 创建关系 (Dic -> Table, Table -> Field)
+# association_proxy 的魔力在这里体现！
+# 这行代码会自动创建一个 EntityHierarchy 对象，并设置好 parent 和 child 的信息
+dic1.children.append(table1) 
+table1.children.append(field1)
+table1.children.append(field2)
+
+# 将所有对象添加到 session 并提交
+session.add_all([dic1, table1, field1, field2])
+session.commit()
+
+print("--- 数据已创建 ---")
+
+# --- 查询和验证 ---
+session.expire_all() # 清空 session 缓存，确保从数据库重新加载
+
+# 查询 Dic
+queried_dic = session.query(Dic).filter_by(name="Customer Dictionary").one()
+print(f"查询到字典: {queried_dic}")
+print(f"字典的子节点: {queried_dic.children}") # 输出应该包含 table1
+
+# 查询 Table
+queried_table = session.query(Table).filter_by(name="Users Table").one()
+print(f"\n查询到表: {queried_table}")
+print(f"表的子节点: {queried_table.children}") # 输出应该包含 field1 和 field2
+print(f"表的父节点: {queried_table.parents}")   # 输出应该包含 dic1
+
+# 查看底层的关联对象
+print(f"\n底层的关联对象 (dic1 -> children): {queried_dic.children_assocs}")
+
+session.close()
