@@ -1,0 +1,49 @@
+from typing import Type, TypeVar, Generic, List
+from app.database import db
+from pydantic import BaseModel
+
+# 使用 TypeVar 定义一个泛型，它必须是 db.Model 的子类
+ModelType = TypeVar("ModelType", bound=db.Model)
+# Pydantic Schema 的泛型
+CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
+
+class BaseDAO(Generic[ModelType]):
+    """
+    通用的数据访问对象 (DAO) 基类
+    提供了对模型的基本 CRUD 操作
+    """
+    def __init__(self, model: Type[ModelType]):
+        """
+        初始化 DAO
+        :param model: SQLAlchemy 的 ORM 模型类
+        """
+        self.model = model
+
+    def get(self, id: int) -> ModelType | None:
+        """根据 ID 获取一个对象"""
+        return db.session.get(self.model, id)
+
+    def get_all(self) -> List[ModelType]:
+        """获取所有对象"""
+        return self.model.query.all()
+
+    def create(self, data: CreateSchemaType) -> ModelType:
+        """
+        创建一个新对象
+        :param data: Pydantic schema 对象
+        """
+        # 将 Pydantic schema 转换为字典
+        obj_in_data = data.model_dump()
+        db_obj = self.model(**obj_in_data)
+        db.session.add(db_obj)
+        db.session.commit()
+        db.session.refresh(db_obj)
+        return db_obj
+
+    def delete(self, id: int) -> ModelType | None:
+        """根据 ID 删除一个对象"""
+        obj = self.get(id)
+        if obj:
+            db.session.delete(obj)
+            db.session.commit()
+        return obj
