@@ -1,0 +1,265 @@
+Part 1: Create Tables and Set Up Initial Data
+-- ===================================================================
+-- Part 1: Schema and Initial Data Setup
+-- ===================================================================
+
+-- Drop old tables for a clean run
+DROP TABLE IF EXISTS product_scd;
+DROP TABLE IF EXISTS release;
+
+-- Create the release table
+CREATE TABLE release (
+    release_id INT PRIMARY KEY,
+    release_name VARCHAR(255),
+    release_time DATETIME,
+    status VARCHAR(50) NOT NULL DEFAULT 'Draft' -- Can be 'Published' or 'Draft'
+);
+
+-- Create the product_scd table (Slowly Changing Dimension)
+CREATE TABLE product_scd (
+    scd_id INT PRIMARY KEY AUTO_INCREMENT,
+    product_id VARCHAR(50) NOT NULL,
+    price DECIMAL(10, 2),
+    release_id INT,
+    status VARCHAR(50) NOT NULL DEFAULT 'Draft', -- Mirrors the release status
+    effective_start_date DATETIME,
+    effective_end_date DATETIME,
+    FOREIGN KEY (release_id) REFERENCES release(release_id),
+    INDEX (product_id, status, effective_start_date, effective_end_date) -- Index for query performance
+);
+
+-- Insert initial data
+-- Base Release: This is the starting point of our timeline, published by default.
+INSERT INTO release (release_id, release_name, release_time, status) VALUES
+(100, 'Base Pricing', '2023-01-01 00:00:00', 'Published');
+
+-- Future Releases: Several planned changes, all starting in 'Draft' status.
+INSERT INTO release (release_id, release_name, release_time, status) VALUES
+(101, 'Tag1 (Singles Day)', '2023-11-01 00:00:00', 'Draft'),
+(102, 'Tag2 (Black Friday)', '2023-11-15 00:00:00', 'Draft'),
+(103, 'Tag3 (Christmas Sale)', '2023-12-01 00:00:00', 'Draft');
+
+-- Insert product data
+-- Base Data for Product P1
+INSERT INTO product_scd (product_id, price, release_id, status, effective_start_date, effective_end_date) VALUES
+('P1', 100.00, 100, 'Published', '2023-01-01 00:00:00', '9999-12-31 23:59:59');
+
+-- Draft changes for Product P1 in different tags
+INSERT INTO product_scd (product_id, price, release_id, status, effective_start_date, effective_end_date) VALUES
+('P1', 90.00, 101, 'Draft', NULL, NULL),
+('P1', 80.00, 102, 'Draft', NULL, NULL),
+('P1', 85.00, 103, 'Draft', NULL, NULL);
+
+-- Base Data for Product P2 (for demonstration purposes)
+INSERT INTO product_scd (product_id, price, release_id, status, effective_start_date, effective_end_date) VALUES
+('P2', 200.00, 100, 'Published', '2023-01-01 00:00:00', '9999-12-31 23:59:59');
+-- P2 only has a change in Tag3
+INSERT INTO product_scd (product_id, price, release_id, status, effective_start_date, effective_end_date) VALUES
+('P2', 180.00, 103, 'Draft', NULL, NULL);
+
+
+SELECT '1. Initial data setup complete.' AS status;
+
+
+Part 2: Core Business Logic - Stored Procedures
+-- ===================================================================
+-- Part 2: Stored Procedures for Core Logic
+-- ===================================================================
+
+-- Change the delimiter to allow semicolons within the stored procedures
+DELIMITER $$
+
+-- ---------------------------------
+-- Procedure 1: Publish a Release
+-- ---------------------------------
+CREATE PROCEDURE `PublishRelease`(IN p_release_id INT)
+BEGIN
+    DECLARE v_release_time DATETIME;
+    DECLARE v_next_release_time DATETIME;
+
+    -- Get the release time of the release being published
+    SELECT release_time INTO v_release_time FROM release WHERE release_id = p_release_id;
+
+    START TRANSACTION;
+
+    -- 1. Update the end_date of the previously active record for each affected product.
+    UPDATE product_scd AS prev
+    JOIN (
+        -- Find the last active record for each product before this new release time
+        SELECT p.product_id, MAX(p.effective_start_date) AS max_start_date
+        FROM product_scd p
+        JOIN product_scd new ON p.product_id = new.product_id
+        WHERE new.release_id = p_release_id
+          AND p.status = 'Published'
+          AND p.effective_start_date < v_release_time
+        GROUP BY p.product_id
+    ) AS latest_prev ON prev.product_id = latest_prev.product_id AND prev.effective_start_date = latest_prev.max_start_date
+    SET prev.effective_end_date = v_release_time;
+
+    -- 2. Find the next scheduled 'Published' release to set the end_date for the current one.
+    SELECT MIN(release_time) INTO v_next_release_time
+    FROM release
+    WHERE status = 'Published' AND release_time > v_release_time;
+
+    -- 3. Update the records for the current release to 'Published' and set their effective dates.
+    UPDATE product_scd
+    SET
+        status = 'Published',
+        effective_start_date = v_release_time,
+        effective_end_date = IFNULL(v_next_release_time, '9999-12-31 23:59:59')
+    WHERE release_id = p_release_id;
+
+    -- 4. Update the status in the main release table.
+    UPDATE release SET status = 'Published' WHERE release_id = p_release_id;
+
+    COMMIT;
+    SELECT CONCAT('Release ', p_release_id, ' has been published successfully.') AS result;
+END$$
+
+
+-- ---------------------------------
+-- Procedure 2: Revert a Release to Draft
+-- ---------------------------------
+CREATE PROCEDURE `RevertReleaseToDraft`(IN p_release_id INT)
+BEGIN
+    DECLARE v_release_time DATETIME;
+    DECLARE v_next_release_time DATETIME;
+
+    -- Get the release time of the release being reverted
+    SELECT release_time INTO v_release_time FROM release WHERE release_id = p_release_id;
+
+    START TRANSACTION;
+
+    -- 1. Find the next scheduled 'Published' release time.
+    SELECT MIN(release_time) INTO v_next_release_time
+    FROM release
+    WHERE status = 'Published' AND release_time > v_release_time;
+
+    -- 2. "Stitch" the timeline: Extend the end_date of the previous record to the start_date of the next published record.
+    UPDATE product_scd AS prev
+    JOIN (
+        -- Find the last active record for each product before the reverted release time
+        SELECT p.product_id, MAX(p.effective_start_date) AS max_start_date
+        FROM product_scd p
+        JOIN product_scd reverted ON p.product_id = reverted.product_id
+        WHERE reverted.release_id = p_release_id
+          AND p.status = 'Published'
+          AND p.effective_start_date < v_release_time
+        GROUP BY p.product_id
+    ) AS latest_prev ON prev.product_id = latest_prev.product_id AND prev.effective_start_date = latest_prev.max_start_date
+    SET prev.effective_end_date = IFNULL(v_next_release_time, '9999-12-31 23:59:59');
+
+    -- 3. Revert the records associated with this release back to 'Draft'.
+    UPDATE product_scd
+    SET
+        status = 'Draft',
+        effective_start_date = NULL,
+        effective_end_date = NULL
+    WHERE release_id = p_release_id;
+
+    -- 4. Update the status in the main release table.
+    UPDATE release SET status = 'Draft' WHERE release_id = p_release_id;
+
+    COMMIT;
+    SELECT CONCAT('Release ', p_release_id, ' has been reverted to Draft.') AS result;
+END$$
+
+-- Restore the default delimiter
+DELIMITER ;
+
+SELECT '2. Stored procedures created successfully.' AS status;
+
+
+Part 3: Data Manipulation Walkthrough
+-- ===================================================================
+-- Part 3: Data Manipulation Walkthrough
+-- ===================================================================
+
+-- Walkthrough A: View the initial "Published" timeline
+SELECT 'A. Initial Published Timeline' AS step;
+SELECT * FROM product_scd WHERE status = 'Published' ORDER BY product_id, effective_start_date;
+
+-- Walkthrough B: Publish Tag2 (Black Friday, Nov 15)
+SELECT 'B. Publishing Tag2 (ID 102)...' AS step;
+CALL PublishRelease(102);
+SELECT * FROM product_scd WHERE status = 'Published' ORDER BY product_id, effective_start_date;
+-- Observation: The end_date for P1's Base record (scd_id=1) is updated to Nov 15, and the Tag2 record (scd_id=3) becomes active.
+
+-- Walkthrough C: Publish Tag3 (Christmas Sale, Dec 01)
+SELECT 'C. Publishing Tag3 (ID 103)...' AS step;
+CALL PublishRelease(103);
+SELECT * FROM product_scd WHERE status = 'Published' ORDER BY product_id, effective_start_date;
+-- Observation: The end_date for P1's Tag2 record (scd_id=3) is updated to Dec 01, and the Tag3 record (scd_id=4) becomes active.
+-- Also, the end_date for P2's Base record (scd_id=5) is updated, and its Tag3 record becomes active.
+
+-- Walkthrough D: Revert Tag2 (Black Friday) to Draft
+SELECT 'D. Reverting Tag2 (ID 102) to Draft...' AS step;
+CALL RevertReleaseToDraft(102);
+SELECT * FROM product_scd WHERE status = 'Published' ORDER BY product_id, effective_start_date;
+-- Observation:
+-- 1. P1's Tag2 record (scd_id=3) disappears from the published list.
+-- 2. P1's Base record (scd_id=1) end_date is automatically "stitched" to Tag3's start_date (Dec 01).
+-- 3. The timeline now correctly jumps from the Base pricing directly to the Tag3 pricing.
+
+-- View the final state of all records for P1 to see the reverted Draft
+SELECT 'E. Final state of all records for P1' AS step;
+SELECT * FROM product_scd WHERE product_id = 'P1' ORDER BY scd_id;
+
+Part 4: Querying and Previewing
+-- ===================================================================
+-- Part 4: Querying and Previewing
+-- ===================================================================
+
+-- Query 1: View the final, live, published timeline
+SELECT 'Query 1: Final Live Timeline' AS step;
+SELECT
+    product_id,
+    price,
+    effective_start_date,
+    effective_end_date,
+    release_name
+FROM product_scd
+JOIN release ON product_scd.release_id = release.release_id
+WHERE product_scd.status = 'Published'
+ORDER BY product_id, effective_start_date;
+
+
+-- Query 2: Preview the world from the perspective of Tag1 (Singles' Day)
+-- Even though we never published Tag1, we can still preview what the world would look like if it were active.
+SELECT 'Query 2: Previewing the world from Tag1 (ID 101) perspective' AS step;
+
+SET @target_release_id = 101; -- Set the Tag we want to preview
+
+WITH TargetInfo AS (
+    SELECT release_time FROM release WHERE release_id = @target_release_id
+),
+TagView AS (
+    -- Part 1: Select the base world (all published records before Tag1's effective time)
+    SELECT
+        scd.product_id, scd.price, r.release_id, r.release_time, 2 AS priority
+    FROM product_scd scd JOIN release r ON scd.release_id = r.release_id
+    WHERE scd.status = 'Published' AND r.release_time <= (SELECT release_time FROM TargetInfo)
+
+    UNION ALL
+
+    -- Part 2: Select the changes from the target Tag itself (highest priority)
+    SELECT
+        scd.product_id, scd.price, r.release_id, r.release_time, 1 AS priority
+    FROM product_scd scd JOIN release r ON scd.release_id = r.release_id
+    WHERE r.release_id = @target_release_id
+)
+-- Part 3: Combine, rank, and select the final view
+SELECT
+    product_id, price, release_id
+FROM (
+    SELECT
+        *,
+        ROW_NUMBER() OVER(PARTITION BY product_id ORDER BY priority ASC, release_time DESC) as rn
+    FROM TagView
+) AS RankedView
+WHERE rn = 1;
+-- Expected Result: The price for P1 will be 90.00 (from Tag1), and the price for P2 will be 200.00 (from Base, as Tag1 did not modify it).
+
+
+
+
