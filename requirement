@@ -1,0 +1,47 @@
+System Requirements for a Versioned Product Pricing System
+1. System Goal
+The primary goal is to design and implement a database system that can manage product attributes (specifically price) over time. The system must use a versioning mechanism based on "Tags" or "Releases." This allows for future changes to be prepared in a Draft state, activated (Published) at a specific time, and safely rolled back (Reverted) to a draft state if necessary, all while maintaining a consistent and accurate historical timeline of product data.
+
+2. Core Concepts
+Release / Tag: A named container for a set of product attribute changes scheduled to become effective at a specific release_time.
+Timeline: The official, chronological sequence of Published releases. This timeline represents the single source of truth for product data at any given point in time.
+Status: Published: The release is part of the official timeline. Its changes are considered "live" and are active during their effective date range.
+Status: Draft: The release is a work-in-progress. Its changes are not part of the live timeline but can be previewed to see their potential impact.
+Functional Requirements
+Requirement 1: Data Modeling
+The system must be built upon a database schema that supports versioning and time-based validity. This requires at least two core tables:
+
+release Table:
+
+Stores metadata for each tag/release.
+Key columns: release_id (Primary Key), release_name, release_time (when the changes are intended to go live), and status (Draft or Published).
+product_scd Table (Slowly Changing Dimension):
+
+Stores the specific attribute values for each product within a given release.
+This table implements a Slowly Changing Dimension (SCD) Type 2 pattern.
+Key columns: product_id, price (or other attributes), release_id (Foreign Key to release), status (mirrors the release status), effective_start_date, and effective_end_date.
+Requirement 2: Set a Tag (Create Draft Changes)
+The system must allow users to create new records in the product_scd table that are associated with a release in Draft status.
+When created, these draft records must have NULL values for effective_start_date and effective_end_date, as they are not yet part of the live timeline.
+Requirement 3: Publish a Tag
+The system must provide an operation to transition a Draft release to Published. This operation must perform the following actions atomically:
+
+Update Status: Change the status of the target release and all its associated product_scd records from Draft to Published.
+Set Start Date: Set the effective_start_date for the newly published records to the release_time of their parent release.
+Update Previous Record: For each product being updated, the system must automatically find the previously active (Published) record and update its effective_end_date to the release_time of the new release. This "closes" the previous time interval and ensures there are no overlaps or gaps in the timeline.
+Set End Date: Set the effective_end_date for the newly published records to the release_time of the next chronological Published release. If no future published release exists, it should be set to a far-future date (e.g., '9999-12-31').
+Requirement 4: Revert a Tag to Draft
+The system must provide a safe and reversible operation to revert a Published release back to Draft. This operation is not a delete; it preserves the data for future use. It must perform the following actions atomically:
+
+Update Status: Change the status of the target release and all its associated product_scd records from Published back to Draft.
+Nullify Dates: Set the effective_start_date and effective_end_date for the reverted records back to NULL.
+"Stitch" the Timeline: For each product affected by the reversion, the system must automatically find the record that was active before the reverted one and extend its effective_end_date to match the effective_start_date of the record that came after the reverted one. This "heals" the gap in the timeline, ensuring continuity.
+Requirement 5: Query the Live Timeline
+The system must provide a straightforward way to query the definitive state of any product at any given point in time.
+This query should only consider records where status = 'Published' and use the effective_start_date and effective_end_date columns to determine which record was active at the specified time.
+Requirement 6: Preview a Draft Tag
+The system must support a "what-if" query that allows users to preview the state of the world from the perspective of a Draft tag.
+This preview should be constructed by:
+Taking the current live (Published) timeline up to the release_time of the draft tag.
+Overlaying the changes from the specified Draft tag on top of that baseline.
+For any product not modified by the draft tag, its value from the live timeline should be shown.
